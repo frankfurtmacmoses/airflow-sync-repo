@@ -1,83 +1,57 @@
+import json
+import pathlib
 
-from datetime import datetime, timedelta
-from textwrap import dedent
-
-# The DAG object; we'll need this to instantiate a DAG
+import airflow.utils.dates
+import requests
+import requests.exceptions as requests_exceptions
 from airflow import DAG
-
-# Operators; we need this to operate!
 from airflow.operators.bash import BashOperator
-with DAG(
-    "tutorial",
-    # These args will get passed on to each operator
-    # You can override them on a per-task basis during operator initialization
-    default_args={
-        "depends_on_past": False,
-        "email": ["airflow@example.com"],
-        "email_on_failure": False,
-        "email_on_retry": False,
-        "retries": 1,
-        "retry_delay": timedelta(minutes=5),
-        # 'queue': 'bash_queue',
-        # 'pool': 'backfill',
-        # 'priority_weight': 10,
-        # 'end_date': datetime(2016, 1, 1),
-        # 'wait_for_downstream': False,
-        # 'sla': timedelta(hours=2),
-        # 'execution_timeout': timedelta(seconds=300),
-        # 'on_failure_callback': some_function, # or list of functions
-        # 'on_success_callback': some_other_function, # or list of functions
-        # 'on_retry_callback': another_function, # or list of functions
-        # 'sla_miss_callback': yet_another_function, # or list of functions
-        # 'trigger_rule': 'all_success'
-    },
-    description="A simple tutorial DAG",
-    schedule=timedelta(days=1),
-    start_date=datetime(2021, 1, 1),
-    catchup=False,
-    tags=["example"],
-) as dag:
+from airflow.operators.python import PythonOperator
 
-    # t1, t2 and t3 are examples of tasks created by instantiating operators
-    t1 = BashOperator(
-        task_id="print_date",
-        bash_command="date",
-    )
+dag = DAG(
+    dag_id="download_rocket_launches",
+    description="Download rocket pictures of recently launched rockets.",
+    start_date=airflow.utils.dates.days_ago(14),
+    schedule_interval="@daily",
+)
 
-    t2 = BashOperator(
-        task_id="sleep",
-        depends_on_past=False,
-        bash_command="sleep 5",
-        retries=3,
-    )
-    t1.doc_md = dedent(
-        """\
-    #### Task Documentation
-    You can document your task using the attributes `doc_md` (markdown),
-    `doc` (plain text), `doc_rst`, `doc_json`, `doc_yaml` which gets
-    rendered in the UI's Task Instance Details page.
-    ![img](http://montcs.bloomu.edu/~bobmon/Semesters/2012-01/491/import%20soul.png)
-    **Image Credit:** Randall Munroe, [XKCD](https://xkcd.com/license.html)
-    """
-    )
+download_launches = BashOperator(
+    task_id="download_launches",
+    bash_command="curl -o /tmp/launches.json -L 'https://ll.thespacedevs.com/2.0.0/launch/upcoming'",  # noqa: E501
+    dag=dag,
+)
 
-    dag.doc_md = __doc__  # providing that you have a docstring at the beginning of the DAG; OR
-    dag.doc_md = """
-    This is a documentation placed anywhere
-    """  # otherwise, type it like this
-    templated_command = dedent(
-        """
-    {% for i in range(5) %}
-        echo "{{ ds }}"
-        echo "{{ macros.ds_add(ds, 7)}}"
-    {% endfor %}
-    """
-    )
 
-    t3 = BashOperator(
-        task_id="templated",
-        depends_on_past=False,
-        bash_command=templated_command,
-    )
+def _get_pictures():
+    # Ensure directory exists
+    pathlib.Path("/tmp/images").mkdir(parents=True, exist_ok=True)
 
-    t1 >> [t2, t3]
+    # Download all pictures in launches.json
+    with open("/tmp/launches.json") as f:
+        launches = json.load(f)
+        image_urls = [launch["image"] for launch in launches["results"]]
+        for image_url in image_urls:
+            try:
+                response = requests.get(image_url)
+                image_filename = image_url.split("/")[-1]
+                target_file = f"/tmp/images/{image_filename}"
+                with open(target_file, "wb") as f:
+                    f.write(response.content)
+                print(f"Downloaded {image_url} to {target_file}")
+            except requests_exceptions.MissingSchema:
+                print(f"{image_url} appears to be an invalid URL.")
+            except requests_exceptions.ConnectionError:
+                print(f"Could not connect to {image_url}.")
+
+
+get_pictures = PythonOperator(
+    task_id="get_pictures", python_callable=_get_pictures, dag=dag
+)
+
+notify = BashOperator(
+    task_id="notify",
+    bash_command='echo "There are now $(ls /tmp/images/ | wc -l) images."',
+    dag=dag,
+)
+
+download_launches >> get_pictures >> notify
